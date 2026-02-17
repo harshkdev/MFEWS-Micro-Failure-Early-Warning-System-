@@ -1,0 +1,279 @@
+#include <WiFi.h>
+#include <ThingSpeak.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ================= DISPLAY =================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ================= PINS =================
+#define DHTPIN 5
+#define DHTTYPE DHT11
+#define VIB_PIN 27
+
+// ================= RAW VIBRATION BANDS =================
+#define VIB_STOPPED 5
+#define VIB_NORMAL_MAX 40
+#define VIB_MODERATE_MAX 80
+#define VIB_WARNING_MAX 120
+
+#define SAFE_TEMP 55
+#define HIGH_TEMP 70
+
+// ================= TIMINGS =================
+#define VIB_SAMPLE_INTERVAL 400
+#define TEMP_INTERVAL 6000
+#define ANALYTICS_INTERVAL 8000
+#define CLOUD_INTERVAL 20000
+
+#define EMA_ALPHA 0.35
+#define DEBOUNCE 7
+
+// ================= WIFI =================
+const char* ssid = "ESP32";
+const char* password = "12345678";
+
+unsigned long channelID = 3264659;
+const char* writeAPIKey = "GOXLESJ28PXCHWCK";
+
+WiFiClient client;
+DHT dht(DHTPIN, DHTTYPE);
+
+// ================= VARIABLES =================
+volatile int vibCounter = 0;
+volatile unsigned long lastPulse = 0;
+
+float vibSamples[20];
+int vibIndex = 0;
+
+float emaVibration = 0;
+float filteredTemp = 26;
+
+unsigned long lastVibSample = 0;
+unsigned long lastTemp = 0;
+unsigned long lastAnalytics = 0;
+unsigned long lastCloud = 0;
+
+// ================= INTERRUPT =================
+void IRAM_ATTR detectVibration() {
+
+  unsigned long now = millis();
+
+  if (now - lastPulse > DEBOUNCE) {
+    vibCounter++;
+    lastPulse = now;
+  }
+}
+
+// ================= WIFI AUTO RECOVER =================
+void connectWiFi() {
+
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.print("Connecting WiFi");
+
+  WiFi.disconnect(true);
+  WiFi.begin(ssid, password);
+
+  int attempts = 0;
+
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  Serial.println(WiFi.status()==WL_CONNECTED ? " ✅" : " FAILED");
+}
+
+// ================= MOTOR STATE =================
+String motorState(float vib, float temp){
+
+  if(vib < VIB_STOPPED)
+    return "STOPPED";
+
+  if(vib <= VIB_NORMAL_MAX && temp < SAFE_TEMP)
+    return "NORMAL";
+
+  if(vib <= VIB_MODERATE_MAX)
+    return "MODERATE";
+
+  if(vib <= VIB_WARNING_MAX || temp > SAFE_TEMP)
+    return "WARNING";
+
+  return "CRITICAL";
+}
+
+// ================= RISK ENGINE =================
+int calculateRisk(float vib, float temp){
+
+  int vibRisk;
+
+  if(vib < VIB_STOPPED)
+      vibRisk = 0;
+  else if(vib <= VIB_NORMAL_MAX)
+      vibRisk = 10;
+  else if(vib <= VIB_MODERATE_MAX)
+      vibRisk = 35;
+  else if(vib <= VIB_WARNING_MAX)
+      vibRisk = 65;
+  else
+      vibRisk = 85;
+
+  int tempRisk = map(temp,25,75,0,15);
+  tempRisk = constrain(tempRisk,0,15);
+
+  return constrain(vibRisk + tempRisk,0,100);
+}
+
+// ================= DISPLAY =================
+void drawDisplay(String state, int risk, int health){
+
+  display.clearDisplay();
+
+  display.setTextSize(1);
+  display.setCursor(0,0);
+  display.println("MFEWS RS380");
+
+  display.setCursor(0,14);
+  display.print("Temp: ");
+  display.print(filteredTemp,1);
+  display.println(" C");
+
+  display.setCursor(0,26);
+  display.print("Vib: ");
+  display.println(emaVibration,0);
+
+  display.setCursor(0,38);
+  display.print("State: ");
+  display.println(state);
+
+  display.setCursor(0,50);
+  display.print("Health:");
+  display.print(health);
+  display.print("%");
+
+  display.display();
+}
+
+// ================= SETUP =================
+void setup() {
+
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(VIB_PIN, INPUT);
+
+  attachInterrupt(
+    digitalPinToInterrupt(VIB_PIN),
+    detectVibration,
+    CHANGE);
+
+  dht.begin();
+  Wire.begin(21,22);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)){
+    Serial.println("OLED FAIL");
+    while(true);
+  }
+
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("Booting MFEWS...");
+  display.display();
+
+  connectWiFi();
+  ThingSpeak.begin(client);
+
+  Serial.println("SYSTEM READY");
+}
+
+// ================= LOOP =================
+void loop() {
+
+connectWiFi();
+
+// -------- VIBRATION SAMPLING --------
+if(millis() - lastVibSample >= VIB_SAMPLE_INTERVAL){
+
+    noInterrupts();
+    int pulses = vibCounter;
+    vibCounter = 0;
+    interrupts();
+
+    float vibPerSec = pulses * (1000.0 / VIB_SAMPLE_INTERVAL);
+
+    // store samples
+    vibSamples[vibIndex++] = vibPerSec;
+    if(vibIndex >= 20) vibIndex = 0;
+
+    lastVibSample = millis();
+}
+
+// -------- TEMPERATURE --------
+if(millis() - lastTemp >= TEMP_INTERVAL){
+
+    float t = dht.readTemperature();
+
+    if(!isnan(t) && t>10 && t<80){
+        filteredTemp = 0.7*filteredTemp + 0.3*t;
+    }
+
+    lastTemp = millis();
+}
+
+// -------- ANALYTICS --------
+if(millis() - lastAnalytics >= ANALYTICS_INTERVAL){
+
+    float sum = 0;
+
+    for(int i=0;i<20;i++)
+        sum += vibSamples[i];
+
+    float avgVib = sum / 20.0;
+
+    emaVibration =
+      EMA_ALPHA * avgVib +
+      (1-EMA_ALPHA) * emaVibration;
+
+    String state = motorState(emaVibration, filteredTemp);
+
+    int risk = calculateRisk(emaVibration, filteredTemp);
+    int health = 100-risk;
+
+    Serial.println("\n===== MFEWS REPORT =====");
+    Serial.print("Temp: "); Serial.println(filteredTemp);
+    Serial.print("Vibration: "); Serial.println(emaVibration);
+    Serial.print("State: "); Serial.println(state);
+    Serial.print("Risk: "); Serial.println(risk);
+    Serial.print("Health: "); Serial.println(health);
+
+    drawDisplay(state, risk, health);
+
+    lastAnalytics = millis();
+}
+
+// -------- CLOUD --------
+if(millis() - lastCloud >= CLOUD_INTERVAL){
+
+    if(WiFi.status()==WL_CONNECTED){
+
+        int risk = calculateRisk(emaVibration, filteredTemp);
+        int health = 100-risk;
+
+        ThingSpeak.setField(1, filteredTemp);
+        ThingSpeak.setField(2, emaVibration);
+        ThingSpeak.setField(3, risk);
+        ThingSpeak.setField(4, health);
+
+        ThingSpeak.writeFields(channelID, writeAPIKey);
+    }
+
+    lastCloud = millis();
+}
+
+}
